@@ -105,19 +105,30 @@ class AuthManager:
 
     def _db(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.db_path, timeout=5, isolation_level=None)
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA busy_timeout=5000")
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA synchronous=FULL")
+        try:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA busy_timeout=5000")
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=FULL")
+        except BaseException:
+            # Setup can fail before _connection receives the handle (e.g. ENOSPC).
+            db.close()
+            raise
         return db
 
     @contextmanager
     def _connection(self):
-        db = self._db()
+        db = None
         try:
+            db = self._db()
             yield db
+        except sqlite3.Error as exc:
+            LOG.error("Authentication storage unavailable: %s",
+                      getattr(exc, "sqlite_errorname", type(exc).__name__))
+            raise AuthError("认证存储暂时不可用，请检查服务器磁盘空间后重试", 503, 5) from exc
         finally:
-            db.close()
+            if db is not None:
+                db.close()
 
     @staticmethod
     def _atomic_json(path: Path, value: dict[str, Any]) -> None:

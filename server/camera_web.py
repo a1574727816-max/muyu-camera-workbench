@@ -435,7 +435,8 @@ class Manager:
             self.event('空间轮转：清理 ' + str(len(removed)) + ' 个最旧已完成片段')
         disk = os.statvfs(self.rec_dir)
         free = disk.f_bavail * disk.f_frsize
-        if self.disk_used >= self.cfg['max_recording_bytes'] or free < RESERVE:
+        free_floor = self.hub.min_free_bytes if getattr(self, 'hub', None) else RESERVE
+        if self.disk_used >= self.cfg['max_recording_bytes'] or free < free_floor:
             self.stop_process(self.rec)
             self.rec = None
             self.record_error = '存储空间不足，录像暂停；已完成片段仍可访问'
@@ -831,6 +832,10 @@ class Manager:
                 with self.lock:
                     self.playback_jobs[path.name] = {'state':'processing','progress':0,'duration':duration}
                 self.cache_tick()
+                if self.hub:
+                    disk = os.statvfs(self.play_dir)
+                    if disk.f_bavail * disk.f_frsize < self.hub.min_free_bytes:
+                        raise RuntimeError('服务器磁盘空间不足，暂停回放缓存，请稍后重试')
                 args = ['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y','-i',str(path),
                     '-map','0:v:0','-map','0:a:0?','-vf','fps=15,scale=1280:-2',
                     '-c:v','libx264','-preset','ultrafast','-tune','zerolatency',
@@ -850,6 +855,11 @@ class Manager:
                             errors.extend(chunk[:8192-len(errors)])
                 threading.Thread(target=drain_errors, daemon=True).start()
                 for line in p.stdout:
+                    if self.hub:
+                        disk = os.statvfs(self.play_dir)
+                        if disk.f_bavail * disk.f_frsize < self.hub.min_free_bytes:
+                            self.stop_process(p)
+                            raise RuntimeError('服务器磁盘空间不足，已停止回放缓存')
                     if line.startswith(b'out_time_us='):
                         value = min(99,round(int(line.split(b'=')[1])/1e6/duration*100))
                         with self.lock:
@@ -1203,15 +1213,23 @@ def build_app(m):
 
     def auth_error(exc: AuthError) -> JSONResponse:
         response = JSONResponse({'detail': exc.detail}, status_code=exc.status)
+        response.headers['Cache-Control'] = 'no-store'
         if exc.retry_after is not None:
             response.headers['Retry-After'] = str(exc.retry_after)
         return response
+
+    @app.exception_handler(AuthError)
+    async def handle_auth_error(request: Request, exc: AuthError):
+        return auth_error(exc)
 
     @app.middleware('http')
     async def auth(request: Request, call_next):
         path = request.url.path
         raw_session = request.cookies.get('cam_session', '')
-        session = m.auth.session(raw_session)
+        try:
+            session = m.auth.session(raw_session)
+        except AuthError as exc:
+            return auth_error(exc)
         public_api = {
             '/api/login', '/api/auth/status', '/api/auth/bind/start',
             '/api/auth/bind/confirm',
@@ -1246,7 +1264,10 @@ def build_app(m):
         response = await call_next(request)
         if (session and raw_session and response.status_code < 400
                 and m.auth.should_slide(request.method, path)):
-            refreshed = m.auth.slide(raw_session)
+            try:
+                refreshed = m.auth.slide(raw_session)
+            except AuthError as exc:
+                return auth_error(exc)
             if refreshed:
                 response.set_cookie(
                     'cam_session', raw_session, max_age=m.auth.session_ttl,
@@ -1432,7 +1453,11 @@ def build_app(m):
             next_auth_check = 0
             while not m.stop.is_set():
                 if time.monotonic() >= next_auth_check:
-                    if not m.auth.session(request.cookies.get('cam_session','')):
+                    try:
+                        valid = m.auth.session(request.cookies.get('cam_session',''))
+                    except AuthError:
+                        break
+                    if not valid:
                         break
                     next_auth_check = time.monotonic()+2
                 m.preview_seen = time.time()
@@ -1522,7 +1547,11 @@ def build_app(m):
                 nonlocal next_auth_check
                 if time.monotonic() < next_auth_check:
                     return True
-                if not m.auth.session(request.cookies.get('cam_session','')):
+                try:
+                    valid = m.auth.session(request.cookies.get('cam_session',''))
+                except AuthError:
+                    return False
+                if not valid:
                     return False
                 next_auth_check = time.monotonic()+2
                 return True

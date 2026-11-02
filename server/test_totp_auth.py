@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import sys
 import tempfile
 import time
@@ -129,3 +130,46 @@ def _bad(auth):
     except AuthError as exc:
         return str(exc.status)
     return "accepted"
+
+
+def test_sqlite_setup_failure_closes_connection_and_recovers(tmp_path, monkeypatch):
+    auth = AuthManager(tmp_path)
+    real_connect = sqlite3.connect
+    connections = []
+
+    class BrokenConnection:
+        closed = False
+
+        def execute(self, sql):
+            if 'journal_mode' in sql:
+                raise sqlite3.OperationalError('disk I/O error')
+
+        def close(self):
+            self.closed = True
+
+    def broken_connect(*args, **kwargs):
+        connection = BrokenConnection()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite3, 'connect', broken_connect)
+    for _ in range(20):
+        with pytest.raises(AuthError) as exc:
+            auth.session('existing-cookie')
+        assert exc.value.status == 503
+        assert exc.value.retry_after == 5
+    assert len(connections) == 20 and all(c.closed for c in connections)
+    monkeypatch.setattr(sqlite3, 'connect', real_connect)
+    assert auth.session('existing-cookie') is None
+    with auth._connection() as db:
+        assert db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+
+
+def test_sqlite_statement_failure_is_unavailable_not_auth_bypass(tmp_path):
+    auth = AuthManager(tmp_path)
+    with pytest.raises(AuthError) as exc:
+        with auth._connection() as db:
+            db.execute('SELECT * FROM missing_table')
+    assert exc.value.status == 503
+    with auth._connection() as db:
+        assert db.execute('SELECT count(*) FROM sessions').fetchone()[0] == 0

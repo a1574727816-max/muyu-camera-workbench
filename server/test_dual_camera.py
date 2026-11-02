@@ -398,3 +398,156 @@ def test_pins_are_reference_counted_across_concurrent_pruners(backend):
     hub.limit = 29 * GB + camera_web.RESERVE
     assert hub.prune()[1] == [str(pinned)]
     assert not hub.pins
+
+
+def test_low_disk_prunes_cache_before_oldest_video_below_quota(backend, monkeypatch):
+    hub = backend.hub
+    first, second = hub.managers.values()
+    cache = media_file(first.play_dir / 'closed.mp4', 300_000_000, 1)
+    oldest = media_file(second.rec_dir / NAMES[0], 800_000_000, 2)
+    newest = media_file(first.rec_dir / NAMES[1], 400_000_000, 3)
+    paths = [cache, oldest, newest]
+    sizes = {p: p.stat().st_size for p in paths}
+    initial_free = hub.min_free_bytes - 500_000_000
+
+    # Simulate an unrelated service using the rest of the filesystem.
+    def usage(path):
+        reclaimed = sum(size for p, size in sizes.items() if not p.exists())
+        return SimpleNamespace(free=initial_free + reclaimed)
+
+    monkeypatch.setattr('multi_camera.shutil.disk_usage', usage)
+    total, removed = hub.prune()
+    assert not cache.exists()
+    assert removed == [str(oldest)]
+    assert newest.exists() and total == 400_000_000
+    assert usage(hub.data).free >= hub.min_free_bytes
+    assert hub.prune() == (total, [])
+
+
+def test_low_disk_never_deletes_active_parts_pins_or_unrelated_files(backend, monkeypatch):
+    hub = backend.hub
+    manager = hub.managers['cam1']
+    manager.rec_prefix = 'active-'
+    manager.rec = SimpleNamespace(poll=lambda: None)
+    active = media_file(manager.rec_dir / 'active-000001.mkv', 100, 1)
+    part = media_file(manager.play_dir / 'playing.part.mp4', 100, 2)
+    pinned = media_file(manager.rec_dir / NAMES[0], 100, 3)
+    unrelated = media_file(backend.root / 'business-data.bin', 100, 4)
+    hub.pin(pinned)
+    monkeypatch.setattr('multi_camera.shutil.disk_usage', lambda path: SimpleNamespace(free=0))
+    total, removed = hub.prune()
+    assert removed == [] and total == 300
+    assert all(p.exists() for p in [active, part, pinned, unrelated])
+
+
+def test_recorder_stops_above_old_256mib_floor_if_system_reserve_is_low(backend, monkeypatch):
+    hub = backend.hub
+    manager = hub.managers['cam1']
+    manager.ip = manager.rec_ip = '192.168.1.10'
+    manager.rec = SimpleNamespace(poll=lambda: None)
+    writer = manager.rec
+    stopped = []
+    monkeypatch.setattr(manager, 'cache_tick', lambda: 0)
+    monkeypatch.setattr(hub, 'prune', lambda: (0, []))
+    monkeypatch.setattr(manager, 'stop_process', stopped.append)
+    monkeypatch.setattr(camera_web.os, 'statvfs', lambda path: SimpleNamespace(
+        f_bavail=hub.min_free_bytes - 1, f_frsize=1))
+    manager.recorder_tick()
+    assert stopped == [writer] and manager.rec is None
+    assert '存储空间不足' in manager.record_error
+
+
+def test_cache_conversion_does_not_start_below_system_reserve(backend, monkeypatch):
+    manager = backend.hub.managers['cam1']
+    source = media_file(manager.rec_dir / NAMES[0], 100)
+    target = manager.play_dir / 'clip.mp4'
+    monkeypatch.setattr(manager, 'cache_tick', lambda: 0)
+    monkeypatch.setattr(manager, 'playback_info', lambda path: {'duration': 600})
+    monkeypatch.setattr(camera_web.os, 'statvfs', lambda path: SimpleNamespace(f_bavail=0, f_frsize=1))
+    manager.convert_playback(source, target)
+    assert manager.playback_jobs[source.name]['state'] == 'error'
+    assert '磁盘空间不足' in manager.playback_jobs[source.name]['message']
+    assert source.exists() and not target.exists()
+
+
+def test_auth_storage_outage_returns_503_and_same_session_recovers(backend, monkeypatch):
+    import sqlite3
+
+    async def check():
+        async with client_for(backend) as client:
+            real_connect = sqlite3.connect
+            def fail(*args, **kwargs):
+                raise sqlite3.OperationalError('disk I/O error')
+            monkeypatch.setattr(sqlite3, 'connect', fail)
+            for path in ['/', '/api/cameras', '/api/state?camera_id=cam1', '/api/live?camera_id=cam2']:
+                response = await client.get(path)
+                assert response.status_code == 503
+                assert response.headers['retry-after'] == '5'
+                assert response.headers['cache-control'] == 'no-store'
+                assert '认证存储' in response.json()['detail']
+            response = await client.post('/api/recording?camera_id=cam1', json={'enabled': False})
+            assert response.status_code == 503
+            assert backend.hub.managers['cam1'].cfg['recording'] is True
+            monkeypatch.setattr(sqlite3, 'connect', real_connect)
+            assert (await client.get('/api/cameras')).status_code == 200
+            assert (await client.get('/api/state?camera_id=cam1')).status_code == 200
+    asyncio.run(check())
+
+
+def test_outage_during_login_fails_closed_without_creating_session(backend, monkeypatch):
+    import sqlite3
+
+    async def check():
+        async with client_for(backend, login=False) as client:
+            real_connect = sqlite3.connect
+            def fail(*args, **kwargs):
+                raise sqlite3.OperationalError('database or disk is full')
+            monkeypatch.setattr(sqlite3, 'connect', fail)
+            response = await client.post('/api/login', json={
+                'code': pyotp.TOTP(backend.secret).at(backend.clock.now)})
+            assert response.status_code == 503 and 'set-cookie' not in response.headers
+            monkeypatch.setattr(sqlite3, 'connect', real_connect)
+            with backend.auth._connection() as db:
+                assert db.execute('SELECT count(*) FROM sessions').fetchone()[0] == 0
+    asyncio.run(check())
+
+
+def test_live_stream_ends_when_auth_storage_fails_after_headers(backend, monkeypatch):
+    from totp_auth import AuthError
+
+    async def check():
+        async with client_for(backend) as client:
+            real_session = backend.auth.session
+            calls = []
+            def session(raw):
+                calls.append(raw)
+                if len(calls) > 1:
+                    raise AuthError('认证存储暂时不可用', 503, 5)
+                return real_session(raw)
+            monkeypatch.setattr(backend.auth, 'session', session)
+            response = await client.get('/api/live?camera_id=cam2')
+            assert response.status_code == 200 and response.content == b''
+            assert len(calls) == 2
+            assert backend.hub.managers['cam2'].preview_clients == 0
+    asyncio.run(check())
+
+
+def test_cache_writer_is_stopped_if_space_drops_during_conversion(backend, monkeypatch):
+    import io
+
+    manager = backend.hub.managers['cam1']
+    source = media_file(manager.rec_dir / NAMES[0], 100)
+    target = manager.play_dir / 'clip.mp4'
+    process = SimpleNamespace(stdout=[b'progress=continue\n'], stderr=io.BytesIO())
+    stopped = []
+    available = iter([manager.hub.min_free_bytes + 1, 0])
+    monkeypatch.setattr(manager, 'cache_tick', lambda: 0)
+    monkeypatch.setattr(manager, 'playback_info', lambda path: {'duration': 600})
+    monkeypatch.setattr(manager, 'stop_process', stopped.append)
+    monkeypatch.setattr(camera_web.subprocess, 'Popen', lambda *args, **kwargs: process)
+    monkeypatch.setattr(camera_web.os, 'statvfs', lambda path: SimpleNamespace(
+        f_bavail=next(available), f_frsize=1))
+    manager.convert_playback(source, target)
+    assert stopped == [process]
+    assert manager.cache_process is None and source.exists()
+    assert '已停止回放缓存' in manager.playback_jobs[source.name]['message']

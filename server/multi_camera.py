@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import threading
 import time
 
@@ -44,6 +45,8 @@ class CameraHub:
             raise ValueError('摄像头配置ID不完整')
         self.cfg = cfg
         self.limit = int(cfg.get('max_recording_bytes', 32_000_000_000))
+        self.min_free_bytes = max(256 * 1024 * 1024,
+                                  int(os.environ.get('CAM_DISK_FREE_BYTES', str(2 * 1024**3))))
         self.managers = {}
         for cid in IDS:
             camera = cfg['cameras'][cid]
@@ -131,6 +134,13 @@ class CameraHub:
                     return 0
             total = sum(size(p) for p in recordings + caches)
             target = self.limit - 256 * 1024 * 1024
+            # A quota bounds our files, but unrelated services can fill the
+            # same filesystem. Reclaim only our eligible files with headroom.
+            free_target = (self.min_free_bytes + 256 * 1024 * 1024
+                           if shutil.disk_usage(self.data).free < self.min_free_bytes else 0)
+            def needs_space():
+                return (total > target or
+                        bool(free_target and shutil.disk_usage(self.data).free < free_target))
             removed = []
             # Cached copies are expendable before original recordings.
             budget = sum(size(p) for p in caches)
@@ -138,14 +148,14 @@ class CameraHub:
             for p in cache_order:
                 if str(p) in protected or p.name.endswith('.part.mp4'):
                     continue
-                if budget <= 512 * 1024 * 1024 and total <= target:
+                if budget <= 512 * 1024 * 1024 and not needs_space():
                     break
                 amount = size(p)
                 p.unlink(missing_ok=True)
                 budget -= amount
                 total -= amount
             for p in sorted(recordings, key=lambda p: p.stat().st_mtime):
-                if total <= target:
+                if not needs_space():
                     break
                 if str(p) in protected:
                     continue
