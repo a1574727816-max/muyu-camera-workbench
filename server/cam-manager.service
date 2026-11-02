@@ -1,0 +1,36 @@
+[Unit]
+Description=MuYu single-file LAN camera manager
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=cam-manager
+Group=cam-manager
+WorkingDirectory=/opt/cam-manager
+Environment=CAM_DATA=/var/lib/cam-manager
+Environment=PYTHONUNBUFFERED=1
+Environment=CAM_BIND_HOST=127.0.0.1
+Environment=CAM_PORT=8080
+Environment=CAM_TRUSTED_PROXIES=127.0.0.1,::1
+Environment=CAM_SESSION_TTL=172800
+Environment=CAM_SESSION_ABSOLUTE_TTL=2592000
+EnvironmentFile=-/etc/cam-manager/environment
+ExecStart=/opt/cam-manager/venv/bin/python /opt/cam-manager/camera_web.py
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/cam-manager
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+LimitNOFILE=512
+MemoryMax=1G
+TasksMax=150
+
+[Install]
+WantedBy=multi-user.target

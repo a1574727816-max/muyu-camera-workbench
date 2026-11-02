@@ -1,0 +1,28 @@
+name: Offline tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: python -m pip install -r server/requirements-dev.txt
+      - run: python -m pytest server -q
+      - run: python server/camera_web.py --self-test
+      - run: node tools/test_camera_selector.cjs
+      - run: sudo apt-get update && sudo apt-get install -y libexpat1-dev
+      - name: Compile embedded components
+        run: |
+          mkdir -p build
+          cc -O2 -std=c11 -Wall -Wextra -Werror embedded/netguard/netguard.c -o build/netguard
+          cc -D_GNU_SOURCE -O2 -std=c11 -Wall -Wextra -Werror embedded/onvif-ptz/bridge.c embedded/onvif-ptz/md5.c -lexpat -lm -o build/onvif-ptz-bridge
+          cc -O2 -std=c11 -Wall -Wextra -Werror -c embedded/rtsp-warmup/warm-rtsp.c -o build/warm-rtsp.o
+          cc -O2 -std=c11 -Wall -Wextra -Werror embedded/ram-reader/loop-ro.c -o build/loop-ro
+      - run: python3 tools/test_netguard_host.py --binary build/netguard --output build/netguard-test.json
